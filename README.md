@@ -2,9 +2,10 @@
 
 A Claude Code pane listing every running Claude Code session on this machine: working, waiting on you, or idle.
 
-![The Session Deck pane: a card per session with its status, model and summary](docs/screenshot.png)
+![The Session Deck pane: a card per session with its status, model, context bar and summary](docs/screenshot.png)
 
 - **A card per session** with its status, model, and a one-line summary of what it's doing. Keys `1`–`9` jump to a session's terminal tab.
+- **Health line.** Each card shows how full the session's context window is (amber from 70%, red from 90%) and what it has cost where there's room. It warns when a working session has made no progress for 5 minutes or the same call has failed 3 times in a row, and names a command that has been running over 2 minutes. The tally counts stalled sessions.
 - **Approval tray.** When a session needs permission and its tab isn't in front, the request waits in the deck: `y` allows, `n` denies with an optional reason the session reads, `j` jumps to its tab. Risky commands (`rm -rf`, `git push`, `sudo`, `curl … | sh`, writes outside the project) take a second press. Requests in auto mode are left to auto mode.
 - **Close all / Resume.** Closes every session after writing an end-of-day summary to `~/session-deck-logs/`, and reopens them later.
 
