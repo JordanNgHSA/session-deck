@@ -5,6 +5,7 @@ import type {
   DeckAnswer,
   DeckAsk,
   DeckClosed,
+  DeckHealth,
   DeckReport,
   DeckSession,
   DeckStatus,
@@ -58,6 +59,15 @@ const LOCK_MS = 600
 // The modes whose asks go to a dialog; under any other (auto, dontAsk,
 // bypassPermissions) an ask is the mode's to settle, and is not held.
 const HOLDABLE_MODES = new Set(['default', 'acceptEdits', 'plan'])
+// A working session with no tool under way and no tool call or turn begun
+// or ended in STALL_MS is stalled; a tool running past LONG_TOOL_MS is named.
+const STALL_MS = 5 * 60 * 1000
+const LONG_TOOL_MS = 2 * 60 * 1000
+// The same call failing this many times in a row is a loop.
+const LOOP_COUNT = 3
+// Context fill, as a percentage: amber from CONTEXT_WARN, red from CONTEXT_FULL.
+const CONTEXT_WARN = 70
+const CONTEXT_FULL = 90
 
 const view = atom({ plugin: 'session-deck', key: 'view' } as const, { now: 0, sessions: [] } as DeckView, {
   shape: 'view-3',
@@ -93,6 +103,11 @@ let home = ''
 let app = ''
 // First prompts by session id; a session with none yet is asked again.
 const titles = new Map<string, string>()
+// This session's main-loop tool calls under way, by call, and the last
+// failed call, for its streak.
+const inFlight = new Map<number, { tool: string; since: number }>()
+let calls = 0
+let lastFail = { key: '', tool: '', count: 0 }
 // The ask at the top of the tray and when it got there, for LOCK_MS.
 let top = { id: '', at: 0 }
 // The person turned the faces' motion off (/sessions-motion), kept across sessions.
@@ -104,6 +119,22 @@ async function report($: EngineInterface, status?: DeckReport['status']) {
   const isChange = status !== undefined && status !== me.status
   me = { ...me, status: status ?? me.status, beatAt: now, changedAt: isChange ? now : me.changedAt }
   await $.fs.write(`${dir}/${me.id}.json`, JSON.stringify(me))
+}
+
+// Changes what this session reports of itself, its status left as it is.
+async function note($: EngineInterface, patch: Partial<DeckReport>) {
+  if (me === undefined) return
+  me = { ...me, ...patch }
+  await report($)
+}
+
+// The longest-running main-loop call under way, if any.
+const oldestRunning = () => [...inFlight.values()].sort((a, b) => a.since - b.since)[0]
+
+// A call's identity for its failure streak: the tool and its input.
+const callKey = (e: object) => {
+  const { agentId: _agent, requestMeta: _meta, tool_use_id: _id, ...call } = e as Record<string, unknown>
+  return JSON.stringify(call)
 }
 
 async function setStatus($: EngineInterface, status: DeckReport['status']) {
@@ -341,6 +372,15 @@ async function refresh($: EngineInterface) {
       title: first || (a.name ?? ''),
       status: statusOf(a, mine, now),
       ask: isFresh && mine.status === 'permission' ? mine.ask : undefined,
+      health: isFresh
+        ? {
+            context: mine.context,
+            costUsd: mine.costUsd,
+            progressAt: mine.progressAt,
+            running: mine.running,
+            failing: mine.failing,
+          }
+        : undefined,
       isBackground: a.kind === 'background',
       shortId: a.id,
       tty: a.pid === undefined ? undefined : terminals.get(a.pid),
@@ -443,6 +483,40 @@ const byUrgency = (a: DeckSession, b: DeckSession) =>
   (RANK[a.status] <= RANK.finished
     ? a.changedAt - b.changedAt
     : projectName(a.cwd).localeCompare(projectName(b.cwd)) || (a.number ?? 99) - (b.number ?? 99))
+
+// What a working session's card warns of, worst first: one call failing
+// again and again, no progress at all, or a call that has run a while.
+function alertOf(one: DeckSession, now: number): { text: string; color: string; isStuck: boolean } | undefined {
+  const health = one.health
+  if (health === undefined || one.status !== 'working') return undefined
+  if (health.failing !== undefined) {
+    return { text: `⚠ ${health.failing.tool} failing ×${health.failing.count}`, color: 'error', isStuck: true }
+  }
+  if (health.running !== undefined) {
+    const ran = now - health.running.since
+    return ran >= LONG_TOOL_MS ? { text: `▸ ${health.running.tool} ${ago(ran)}`, color: 'subtle', isStuck: false } : undefined
+  }
+  if (health.progressAt !== undefined && now - health.progressAt >= STALL_MS) {
+    return { text: `⚠ no progress ${ago(now - health.progressAt)}`, color: 'warning', isStuck: true }
+  }
+  return undefined
+}
+
+// The context window's fill as a bar, and the cost where the card has room:
+// "ctx ▓▓▓░░░ 42% · $3.10".
+function contextLine(health: DeckHealth, width: number) {
+  if (health.context === undefined) return undefined
+  const percent = Math.max(0, Math.min(100, Math.round(health.context.percent)))
+  const label = ` ${percent}%`
+  const cells = Math.max(3, Math.min(8, width - 4 - label.length))
+  const filled = Math.round((cells * percent) / 100)
+  const bar = `ctx ${'▓'.repeat(filled)}${'░'.repeat(cells - filled)}${label}`
+  const cost = health.costUsd === undefined ? '' : ` · $${health.costUsd.toFixed(2)}`
+  return {
+    text: bar.length + cost.length <= width ? bar + cost : bar,
+    color: percent >= CONTEXT_FULL ? 'error' : percent >= CONTEXT_WARN ? 'warning' : undefined,
+  }
+}
 
 function ago(ms: number) {
   const s = Math.max(0, Math.round(ms / 1000))
@@ -1342,7 +1416,10 @@ export const register: Register = on => {
   })
 
   on('turn.start', async ($, e, next) => {
-    if (e.agentId === undefined) await setStatus($, 'working')
+    if (e.agentId === undefined) {
+      if (me !== undefined) me = { ...me, progressAt: await $.clock.now() }
+      await setStatus($, 'working')
+    }
 
     return next(e)
   })
@@ -1351,6 +1428,9 @@ export const register: Register = on => {
   // they interrupted, or watched end, does not.
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
+      // A turn's end leaves nothing running.
+      inFlight.clear()
+      if (me !== undefined) me = { ...me, progressAt: await $.clock.now(), running: undefined }
       await setStatus($, e.isAborted ? 'idle' : 'finished')
       await markSeen($)
     }
@@ -1370,13 +1450,46 @@ export const register: Register = on => {
     return (await holdAsk($, e)) ?? verdict
   }).catch(($, e, next) => next(e))
 
+  // A call beginning or ending is progress, a subagent's too; the main
+  // loop's calls are what runs, and the same one failing again is a streak.
   on('tool.call', async ($, e, next) => {
     const isQuestion = e.tool === 'AskUserQuestion' || e.tool === 'ExitPlanMode'
     if (isQuestion) await setStatus($, 'question')
-    const ran = await next(e)
-    if (me?.status === 'permission' || me?.status === 'question') await setStatus($, 'working')
+    const isMain = e.agentId === undefined
+    const call = ++calls
+    if (isMain) inFlight.set(call, { tool: e.tool, since: await $.clock.now() })
+    await note($, { progressAt: await $.clock.now(), running: oldestRunning() })
+    try {
+      const ran = await next(e)
+      if (isMain) {
+        const key = callKey(e)
+        lastFail =
+          'isError' in ran && ran.isError
+            ? { key, tool: e.tool, count: lastFail.key === key ? lastFail.count + 1 : 1 }
+            : { key: '', tool: '', count: 0 }
+      }
+      if (me?.status === 'permission' || me?.status === 'question') await setStatus($, 'working')
 
-    return ran
+      return ran
+    } finally {
+      inFlight.delete(call)
+      await note($, {
+        progressAt: await $.clock.now(),
+        running: oldestRunning(),
+        failing: lastFail.count >= LOOP_COUNT ? { tool: lastFail.tool, count: lastFail.count } : undefined,
+      })
+    }
+  }).catch(($, e, next) => next(e))
+
+  // The context window's fill and the cost so far, as the engine measures them.
+  on('session.measure', async ($, e, next) => {
+    const { percent, window } = e.context
+    await note($, {
+      context: percent === undefined ? me?.context : { percent, window },
+      costUsd: e.cost?.usd ?? me?.costUsd,
+    })
+
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -1419,6 +1532,7 @@ export const register: Register = on => {
     const replied = count(status => status === 'finished')
     const working = count(status => status === 'working')
     const resting = count(status => status === 'idle' || status === 'done')
+    const stuck = list.filter(one => alertOf(one, now)?.isStuck).length
     const isMeListed = list.some(one => one.id === me?.id)
 
     // Brings a session's tab forward; where it can't, copies the command that
@@ -1485,6 +1599,8 @@ export const register: Register = on => {
               ? `${look.glyph} ${one.ask.tool}: ${one.ask.preview}`
               : `${look.glyph} ${look.label}`
       const statusColor = said === 'allow' ? 'success' : said === 'deny' ? 'error' : look.color
+      const alert = alertOf(one, now)
+      const context = one.health === undefined ? undefined : contextLine(one.health, inner)
       return (
         <Box
           key={one.id}
@@ -1521,7 +1637,17 @@ export const register: Register = on => {
             </Text>
             {status.length + 1 + age.length <= inner && <Text dimColor> {age}</Text>}
           </Text>
+          {alert !== undefined && (
+            <Text color={alert.color} bold={alert.isStuck}>
+              {cut(alert.text, inner)}
+            </Text>
+          )}
           {one.model !== undefined && <Text dimColor>{engineLine(one.model, one.effort, inner)}</Text>}
+          {context !== undefined && (
+            <Text color={context.color} dimColor={context.color === undefined}>
+              {cut(context.text, inner)}
+            </Text>
+          )}
           {about !== '' && (
             <Text dimColor={one.summary === undefined}>{clamp(about, inner, SUMMARY_LINES)}</Text>
           )}
@@ -1661,6 +1787,11 @@ export const register: Register = on => {
       replied > 0 && (
         <Text key="replied" color={WAIT_COLOR}>
           {replied} replied
+        </Text>
+      ),
+      stuck > 0 && (
+        <Text key="stuck" bold color="warning">
+          {stuck} stalled
         </Text>
       ),
       working > 0 && (

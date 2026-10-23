@@ -12,6 +12,20 @@ export type DeckReport = {
   beatAt: number
   // The permission ask the session holds for the deck to answer.
   ask?: DeckAsk
+} & DeckHealth
+
+// How a session is faring, as it reports itself: how full its context is,
+// what it has cost, and whether it is getting anywhere.
+export type DeckHealth = {
+  // The live context window's fill, as the status line has it.
+  context?: { percent: number; window: number }
+  costUsd?: number
+  // When a tool call or a turn last began or ended.
+  progressAt?: number
+  // The main loop's longest-running tool call now under way.
+  running?: { tool: string; since: number }
+  // One call, the same tool and input, failing this many times in a row.
+  failing?: { tool: string; count: number }
 }
 
 // A tool call held at its permission ask, its tab's dialog not yet shown,
@@ -57,6 +71,8 @@ export type DeckSession = {
   number?: number
   // Its held permission ask, for the tray.
   ask?: DeckAsk
+  // From its fresh report; absent for a session not running this mod.
+  health?: DeckHealth
 }
 
 // ~/.claude/session-deck/last-closed.json: what Close all ended, for Resume
