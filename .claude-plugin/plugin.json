@@ -1,0 +1,6 @@
+{
+  "name": "session-deck",
+  "version": "0.1.0",
+  "description": "A pane listing every running Claude Code session on this machine: working, waiting on you, or idle",
+  "types": "./types/index.d.ts"
+}
